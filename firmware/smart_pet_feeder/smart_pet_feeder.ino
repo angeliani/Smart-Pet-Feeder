@@ -1,17 +1,47 @@
 /*
-  Smart Pet Feeder - firmware ESP32 (versi awal / placeholder yang sudah jalan di Wokwi)
+  ============================================================
+  SMART PET FEEDER
+  ESP32 Firmware
+  ============================================================
 
-  Alur: sensor -> logika EDGE -> MQTT over TLS (8883) -> cloud/dashboard
-  Edge (tetap jalan walau internet putus):
-    1. Jadwal makan lokal (NTP sekali sync, lalu RTC ESP32 jalan sendiri)
-    2. Cek stok (HC-SR04) + deteksi low_stock dengan histeresis
-    3. Ukur porsi (load cell) -> status feeding OK / FAILED
-    4. Batas harian & jeda minimum (anti overfeeding)
-    5. Report-by-exception: kirim data hanya bila berubah / heartbeat
-    6. Event dibuffer dan dikirim ulang saat koneksi pulih
+  Architecture:
+    Sensors
+       ↓
+    Edge Processing
+       ↓
+    MQTT over TLS :8883
+       ↓
+    Node-RED
+       ↓
+    MongoDB + Dashboard + Telegram
 
-  Library: PubSubClient, ArduinoJson (v7), ESP32Servo, HX711 (bogde)
+  Sensors:
+    1. HC-SR04      -> food stock estimation
+    2. HX711        -> food weight / portion measurement
+
+  Actuator:
+    1. Servo        -> food dispensing gate
+
+  MQTT Topics:
+    petfeeder/{DEVICE_ID}/telemetry
+    petfeeder/{DEVICE_ID}/event
+    petfeeder/{DEVICE_ID}/status
+    petfeeder/{DEVICE_ID}/cmd
+
+  Commands:
+    Feed:
+      {"action":"feed","grams":30}
+
+    Tare:
+      {"action":"tare"}
+
+  Libraries:
+    - PubSubClient
+    - ArduinoJson v7
+    - ESP32Servo
+    - HX711
 */
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -19,55 +49,125 @@
 #include <ESP32Servo.h>
 #include <HX711.h>
 #include <time.h>
+#include <math.h>
 
 #include "config.h"
 #include "secrets.h"
 #include "ca_cert.h"
 
+// ============================================================
+// OBJECTS
+// ============================================================
 WiFiClientSecure net;
 PubSubClient mqtt(net);
+
 HX711 scale;
 Servo gate;
 
-char topicTelemetry[64], topicEvent[64], topicStatus[64], topicCmd[64];
+// ============================================================
+// MQTT TOPICS
+// ============================================================
+char topicTelemetry[64];
+char topicEvent[64];
+char topicStatus[64];
+char topicCmd[64];
 
-// ---------- state ----------
-static float    lastPubStock = -100, lastPubWeight = -1000;
-static uint32_t lastPubMs = 0, lastSampleMs = 0, lastMqttTry = 0, lastFeedMs = 0;
-static uint32_t samplesTaken = 0, msgsSent = 0;
-static float    dailyGrams = 0;
-static int      lastYday = -1, lastFeedKey = -1;
-static bool     lowStockFlag = false;
-static volatile bool pendingFeed = false, pendingTare = false;
-static float    pendingFeedG = DEFAULT_PORTION_G;
+// ============================================================
+// SYSTEM STATE
+// ============================================================
+// Telemetry
+static float lastPubStock = -100.0f;
+static float lastPubWeight = -1000.0f;
 
-// ---------- buffer event (ring buffer) ----------
+static uint32_t lastPubMs = 0;
+static uint32_t lastSampleMs = 0;
+
+// MQTT / WiFi
+static uint32_t lastMqttTry = 0;
+static uint32_t lastWifiTry = 0;
+
+// Feeding
+static uint32_t lastFeedMs = 0;
+
+// Counters
+static uint32_t samplesTaken = 0;
+static uint32_t msgsSent = 0;
+
+// Daily feeding
+static float dailyGrams = 0.0f;
+static int lastYday = -1;
+static int lastFeedKey = -1;
+
+// Low stock state
+static bool lowStockFlag = false;
+
+// Pending commands
+static volatile bool pendingFeed = false;
+static volatile bool pendingTare = false;
+
+static float pendingFeedG = DEFAULT_PORTION_G;
+
+// ============================================================
+// EVENT RING BUFFER
+// ============================================================
 #define EVT_BUF 10
-#define EVT_LEN 220
-static char    evtBuf[EVT_BUF][EVT_LEN];
-static uint8_t evtHead = 0, evtCount = 0;
+#define EVT_LEN 300
 
+static char evtBuf[EVT_BUF][EVT_LEN];
+static uint8_t evtHead = 0;
+static uint8_t evtCount = 0;
+
+// ============================================================
+// EVENT BUFFER FUNCTIONS
+// ============================================================
 static void queueEvent(const char* json) {
-  if (evtCount == EVT_BUF) { evtHead = (evtHead + 1) % EVT_BUF; evtCount--; }  // buang yang terlama
-  strlcpy(evtBuf[(evtHead + evtCount) % EVT_BUF], json, EVT_LEN);
+  // Jika buffer penuh, buang event paling lama
+  if (evtCount == EVT_BUF) {
+    evtHead = (evtHead + 1) % EVT_BUF;
+    evtCount--;
+  }
+
+  uint8_t index = (evtHead + evtCount) % EVT_BUF;
+  strlcpy(evtBuf[index], json, EVT_LEN);
   evtCount++;
 }
 
 static void flushEvents() {
-  while (evtCount && mqtt.connected()) {
-    if (!mqtt.publish(topicEvent, evtBuf[evtHead], false)) break;
+  while (evtCount > 0 && mqtt.connected()) {
+    if (!mqtt.publish(topicEvent, evtBuf[evtHead], false)) {
+      // Publish gagal.
+      // Jangan hapus event supaya bisa dicoba lagi.
+      break;
+    }
+
     evtHead = (evtHead + 1) % EVT_BUF;
     evtCount--;
     msgsSent++;
   }
 }
 
+// ============================================================
+// TIME
+// ============================================================
 static uint32_t nowEpoch() {
   time_t t = time(nullptr);
-  return t > 1600000000 ? (uint32_t)t : 0;  // 0 = waktu belum tersinkron
+  if (t > 1600000000) {
+    return (uint32_t)t;
+  }
+  // 0 = waktu belum valid
+  return 0;
 }
 
-static void emitEvent(const char* type, const char* status, float targetG, float deliveredG, const char* reason) {
+// ============================================================
+// EVENT GENERATOR
+// ============================================================
+static void emitEvent(
+  const char* type,
+  const char* status,
+  float targetG,
+  float deliveredG,
+  const char* reason,
+  const char* trigger = "") {
   JsonDocument doc;
   doc["ts"] = nowEpoch();
   doc["device"] = DEVICE_ID;
@@ -76,198 +176,620 @@ static void emitEvent(const char* type, const char* status, float targetG, float
   doc["target_g"] = targetG;
   doc["delivered_g"] = deliveredG;
   doc["reason"] = reason;
+  doc["trigger"] = trigger;
+
   char buf[EVT_LEN];
   serializeJson(doc, buf, sizeof(buf));
+
   Serial.printf("[EVENT] %s\n", buf);
   queueEvent(buf);
 }
 
-// ---------- sensor ----------
+// ============================================================
+// WIFI
+// ============================================================
+static void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  if (millis() - lastWifiTry < 5000) {
+    return;
+  }
+
+  lastWifiTry = millis();
+  Serial.println("[WiFi] mencoba koneksi...");
+
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+// ============================================================
+// SENSOR - HC-SR04
+// ============================================================
 static float readDistanceCm() {
-  float valid[3]; int n = 0;
+  float valid[3];
+  int n = 0;
+
   for (int i = 0; i < 3; i++) {
-    digitalWrite(PIN_TRIG, LOW);  delayMicroseconds(2);
-    digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
     digitalWrite(PIN_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_TRIG, LOW);
+
     long us = pulseIn(PIN_ECHO, HIGH, 30000);
-    if (us > 0) valid[n++] = us * 0.0343f / 2.0f;
+    if (us > 0) {
+      valid[n++] = us * 0.0343f / 2.0f;
+    }
+
     delay(30);
   }
-  if (n == 0) return NAN;
-  for (int i = 1; i < n; i++) {            // insertion sort, ambil median
-    float k = valid[i]; int j = i - 1;
-    while (j >= 0 && valid[j] > k) { valid[j + 1] = valid[j]; j--; }
-    valid[j + 1] = k;
+
+  // Tidak ada pembacaan valid
+  if (n == 0) {
+    return NAN;
   }
+
+  // Sort untuk mengambil median
+  for (int i = 1; i < n; i++) {
+    float key = valid[i];
+    int j = i - 1;
+
+    while (j >= 0 && valid[j] > key) {
+      valid[j + 1] = valid[j];
+      j--;
+    }
+
+    valid[j + 1] = key;
+  }
+
   return valid[n / 2];
 }
 
+// ============================================================
+// STOCK PERCENTAGE
+// ============================================================
 static float stockPercent(float cm) {
-  if (isnan(cm)) return -1;
-  float pct = (BOWL_EMPTY_CM - cm) / (BOWL_EMPTY_CM - BOWL_FULL_CM) * 100.0f;
+  if (isnan(cm)) {
+    return -1;
+  }
+
+  float denominator = BOWL_EMPTY_CM - BOWL_FULL_CM;
+  if (denominator <= 0) {
+    return -1;
+  }
+
+  float pct = ((BOWL_EMPTY_CM - cm) / denominator) * 100.0f;
   return constrain(pct, 0.0f, 100.0f);
 }
 
+// ============================================================
+// SENSOR - HX711
+// ============================================================
 static float readWeightG() {
-  if (!scale.is_ready()) return NAN;
-  return scale.get_units(3);
+  if (!scale.is_ready()) {
+    return NAN;
+  }
+
+  float weight = scale.get_units(3);
+
+  // Hindari nilai negatif akibat noise kecil
+  if (weight < 0 && weight > -5) {
+    weight = 0;
+  }
+
+  return weight;
 }
 
-// ---------- aktuator: feeding ----------
+// ============================================================
+// FEEDING
+// ============================================================
 static void feedPortion(float targetG, const char* trigger) {
   uint32_t now = millis();
-  if (lastFeedMs && now - lastFeedMs < MIN_FEED_GAP_MS) {
-    emitEvent("feed", "REJECTED", targetG, 0, "too_soon"); return;
+
+  // ----------------------------------------------------------
+  // Validasi target
+  // ----------------------------------------------------------
+  targetG = constrain(targetG, 5.0f, 60.0f);
+
+  // ----------------------------------------------------------
+  // Minimum feeding gap
+  // ----------------------------------------------------------
+  if (lastFeedMs != 0 && now - lastFeedMs < MIN_FEED_GAP_MS) {
+    Serial.println("[FEED] ditolak: terlalu cepat");
+    emitEvent("feed", "REJECTED", targetG, 0, "too_soon", trigger);
+    return;
   }
-  if (dailyGrams + targetG > MAX_DAILY_GRAMS) {
-    emitEvent("feed", "REJECTED", targetG, 0, "daily_limit"); return;
+
+  // ----------------------------------------------------------
+  // Daily limit
+  // ----------------------------------------------------------
+  if (dailyGrams >= MAX_DAILY_GRAMS) {
+    Serial.println("[FEED] ditolak: daily limit");
+    emitEvent("feed", "REJECTED", targetG, 0, "daily_limit", trigger);
+    return;
   }
-  Serial.printf("[FEED] mulai, target %.0f g (%s)\n", targetG, trigger);
-  float start = readWeightG(); if (isnan(start)) start = 0;
+
+  // ----------------------------------------------------------
+  // Jangan biarkan target melewati sisa daily limit
+  // ----------------------------------------------------------
+  float remaining = MAX_DAILY_GRAMS - dailyGrams;
+  if (targetG > remaining) {
+    Serial.println("[FEED] ditolak: target melebihi sisa daily limit");
+    emitEvent("feed", "REJECTED", targetG, 0, "target_exceeds_daily_limit", trigger);
+    return;
+  }
+
+  Serial.printf("[FEED] mulai | target %.1f g | trigger=%s\n", targetG, trigger);
+
+  // ----------------------------------------------------------
+  // Ambil berat awal
+  // ----------------------------------------------------------
+  float startWeight = readWeightG();
+  if (isnan(startWeight)) {
+    Serial.println("[FEED] HX711 tidak tersedia");
+    emitEvent("feed", "FAILED", targetG, 0, "hx711_not_ready", trigger);
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Buka servo
+  // ----------------------------------------------------------
   gate.write(SERVO_OPEN_DEG);
-  uint32_t t0 = millis();
+
+  uint32_t startMs = millis();
   float delivered = 0;
-  while (millis() - t0 < FEED_TIMEOUT_MS) {
+
+  // ----------------------------------------------------------
+  // Feeding loop
+  // ----------------------------------------------------------
+  while (millis() - startMs < FEED_TIMEOUT_MS) {
     delay(100);
-    float w = readWeightG();
-    delivered = isnan(w) ? 0 : w - start;
-    if (delivered >= targetG) break;
+    float currentWeight = readWeightG();
+
+    if (!isnan(currentWeight)) {
+      delivered = currentWeight - startWeight;
+      if (delivered < 0) {
+        delivered = 0;
+      }
+    }
+
+    // Target tercapai
+    if (delivered >= targetG) {
+      break;
+    }
   }
+
+  // ----------------------------------------------------------
+  // Tutup servo
+  // ----------------------------------------------------------
   gate.write(SERVO_CLOSED_DEG);
   lastFeedMs = millis();
+
+  // ----------------------------------------------------------
+  // Evaluasi hasil
+  // ----------------------------------------------------------
   bool ok = delivered >= targetG * MIN_RATIO_OK;
-  if (ok) dailyGrams += delivered;
-  emitEvent("feed", ok ? "OK" : "FAILED", targetG, delivered, ok ? trigger : "under_delivered_or_jam");
+
+  if (ok) {
+    // Gunakan berat aktual
+    dailyGrams += delivered;
+
+    // Safety clamp
+    if (dailyGrams > MAX_DAILY_GRAMS) {
+      dailyGrams = MAX_DAILY_GRAMS;
+    }
+
+    Serial.printf("[FEED] berhasil | %.1f g\n", delivered);
+    emitEvent("feed", "OK", targetG, delivered, "feeding_completed", trigger);
+  } else {
+    Serial.printf("[FEED] gagal | delivered %.1f g\n", delivered);
+    emitEvent("feed", "FAILED", targetG, delivered, "under_delivered_or_jam", trigger);
+  }
 }
 
+// ============================================================
+// SCHEDULER
+// ============================================================
 static void runScheduler() {
   struct tm t;
-  if (!getLocalTime(&t, 0)) return;                    // waktu belum sync -> lewati
-  if (t.tm_yday != lastYday) { lastYday = t.tm_yday; dailyGrams = 0; }
-  for (uint8_t h : FEED_HOURS) {
+
+  // Waktu belum tersedia
+  if (!getLocalTime(&t, 0)) {
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Reset daily counter ketika hari berganti
+  // ----------------------------------------------------------
+  if (t.tm_yday != lastYday) {
+    lastYday = t.tm_yday;
+    dailyGrams = 0;
+    lastFeedKey = -1;
+    Serial.println("[SCHEDULE] hari baru, daily counter reset");
+  }
+
+  // ----------------------------------------------------------
+  // Check semua jadwal
+  // ----------------------------------------------------------
+  for (uint8_t i = 0; i < FEED_HOURS_COUNT; i++) {
+    uint8_t h = FEED_HOURS[i];
     int key = t.tm_yday * 24 + h;
+
     if (t.tm_hour == h && t.tm_min == 0 && key != lastFeedKey) {
       lastFeedKey = key;
+      Serial.printf("[SCHEDULE] waktu feeding %02d:00\n", h);
       feedPortion(DEFAULT_PORTION_G, "schedule");
     }
   }
 }
 
-// ---------- MQTT ----------
+// ============================================================
+// MQTT MESSAGE CALLBACK
+// ============================================================
 static void onMessage(char* topic, byte* payload, unsigned int len) {
+  Serial.printf("[MQTT CMD] topic=%s\n", topic);
+
   JsonDocument doc;
-  if (deserializeJson(doc, payload, len)) return;
+  DeserializationError error = deserializeJson(doc, payload, len);
+
+  if (error) {
+    Serial.printf("[MQTT CMD] JSON error: %s\n", error.c_str());
+    return;
+  }
+
   const char* action = doc["action"] | "";
-  if (!strcmp(action, "feed")) {
-    float g = doc["grams"] | (float)DEFAULT_PORTION_G;
-    pendingFeedG = constrain(g, 5.0f, 60.0f);
+
+  // ----------------------------------------------------------
+  // FEED COMMAND
+  // ----------------------------------------------------------
+  if (strcmp(action, "feed") == 0) {
+    float grams = doc["grams"] | (float)DEFAULT_PORTION_G;
+    grams = constrain(grams, 5.0f, 60.0f);
+
+    pendingFeedG = grams;
     pendingFeed = true;
-  } else if (!strcmp(action, "tare")) {
+
+    Serial.printf("[CMD] feed %.1f g\n", grams);
+  }
+  // ----------------------------------------------------------
+  // TARE COMMAND
+  // ----------------------------------------------------------
+  else if (strcmp(action, "tare") == 0) {
     pendingTare = true;
+    Serial.println("[CMD] tare requested");
+  } else {
+    Serial.printf("[CMD] unknown action: %s\n", action);
   }
 }
 
+// ============================================================
+// MQTT CONNECTION
+// ============================================================
 static void connectMqtt() {
-  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
-  if (millis() - lastMqttTry < 5000) return;             // non-blocking, coba tiap 5 dtk
+  if (mqtt.connected()) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  // Coba setiap 5 detik
+  if (millis() - lastMqttTry < 5000) {
+    return;
+  }
+
   lastMqttTry = millis();
-  String cid = String(DEVICE_ID) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  // Client ID unik
+  String clientId = String(DEVICE_ID) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   Serial.print("[MQTT] connecting... ");
-  if (mqtt.connect(cid.c_str(), MQTT_USER, MQTT_PASS, topicStatus, 1, true, "offline")) {
+
+  bool connected = mqtt.connect(
+    clientId.c_str(),
+    MQTT_USER,
+    MQTT_PASS,
+    // Last Will topic
+    topicStatus,
+    // Will QoS
+    1,
+    // Will retain
+    true,
+    // Will payload
+    "offline");
+
+  if (connected) {
     Serial.println("OK");
+
+    // --------------------------------------------------------
+    // Publish online
+    // --------------------------------------------------------
     mqtt.publish(topicStatus, "online", true);
-    mqtt.subscribe(topicCmd, 1);
+
+    // --------------------------------------------------------
+    // Subscribe command
+    // --------------------------------------------------------
+    if (mqtt.subscribe(topicCmd, 1)) {
+      Serial.printf("[MQTT] subscribed: %s\n", topicCmd);
+    } else {
+      Serial.println("[MQTT] subscribe gagal");
+    }
+
+    // --------------------------------------------------------
+    // Setelah reconnect, event buffer akan dikirim
+    // --------------------------------------------------------
+    flushEvents();
   } else {
     Serial.printf("gagal rc=%d\n", mqtt.state());
   }
 }
 
+// ============================================================
+// TELEMETRY
+// ============================================================
 static void sampleAndPublish() {
   samplesTaken++;
-  float cm = readDistanceCm();
-  float stock = stockPercent(cm);
-  float w = readWeightG();
 
-  // keputusan edge: low stock dengan histeresis (tidak spam)
+  // ----------------------------------------------------------
+  // Read sensors
+  // ----------------------------------------------------------
+  float distance = readDistanceCm();
+  float stock = stockPercent(distance);
+  float weight = readWeightG();
+
+  // ----------------------------------------------------------
+  // LOW STOCK EDGE DECISION
+  // ----------------------------------------------------------
   if (stock >= 0) {
-    if (!lowStockFlag && stock < LOW_STOCK_PCT) { lowStockFlag = true;  emitEvent("low_stock", "ALERT", 0, 0, "stock_below_threshold"); }
-    if (lowStockFlag && stock > LOW_STOCK_PCT + 10) lowStockFlag = false;
+    // Masuk kondisi low stock
+    if (!lowStockFlag && stock < LOW_STOCK_PCT) {
+      lowStockFlag = true;
+      Serial.printf("[EDGE] LOW STOCK %.1f%%\n", stock);
+      emitEvent("low_stock", "ALERT", stock, 0, "stock_below_threshold", "edge");
+    }
+
+    // Hysteresis
+    if (lowStockFlag && stock > LOW_STOCK_PCT + 10) {
+      lowStockFlag = false;
+      emitEvent("low_stock", "NORMAL", stock, 0, "stock_recovered", "edge");
+    }
   }
 
-  // keputusan edge: kirim hanya bila ada perubahan berarti / heartbeat
-  bool changed = fabsf(stock - lastPubStock) >= DELTA_STOCK_PCT ||
-                 (!isnan(w) && fabsf(w - lastPubWeight) >= DELTA_WEIGHT_G);
-  bool beat = millis() - lastPubMs >= HEARTBEAT_MS;
-  if (!(changed || beat || lastPubMs == 0)) return;
+  // ----------------------------------------------------------
+  // REPORT BY EXCEPTION
+  // ----------------------------------------------------------
+  bool changed = false;
 
+  // Stock berubah cukup signifikan
+  if (stock >= 0 && (lastPubStock < 0 || fabsf(stock - lastPubStock) >= DELTA_STOCK_PCT)) {
+    changed = true;
+  }
+
+  // Weight berubah cukup signifikan
+  if (!isnan(weight) && (lastPubWeight < 0 || fabsf(weight - lastPubWeight) >= DELTA_WEIGHT_G)) {
+    changed = true;
+  }
+
+  // Heartbeat
+  bool heartbeat = (lastPubMs == 0 || millis() - lastPubMs >= HEARTBEAT_MS);
+
+  // Jika tidak berubah dan belum heartbeat,
+  // tidak perlu kirim.
+  if (!changed && !heartbeat) {
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // TELEMETRY JSON
+  // ----------------------------------------------------------
   JsonDocument doc;
   doc["ts"] = nowEpoch();
   doc["device"] = DEVICE_ID;
-  doc["distance_cm"] = isnan(cm) ? -1 : cm;
+  doc["distance_cm"] = isnan(distance) ? -1 : distance;
   doc["stock_pct"] = stock;
-  doc["bowl_g"] = isnan(w) ? -1 : w;
+  doc["bowl_g"] = isnan(weight) ? -1 : weight;
   doc["daily_g"] = dailyGrams;
   doc["rssi"] = WiFi.RSSI();
-  doc["samples"] = samplesTaken;   // bahan tabel perbandingan sebelum/sesudah edge
+  doc["samples"] = samplesTaken;
+  // Nomor pesan yang akan dikirim
   doc["sent"] = msgsSent + 1;
-  char buf[256];
+
+  char buf[350];
   serializeJson(doc, buf, sizeof(buf));
+
   Serial.printf("[TELEMETRY] %s\n", buf);
-  if (mqtt.connected() && mqtt.publish(topicTelemetry, buf, false)) {
-    msgsSent++;
-    lastPubMs = millis(); lastPubStock = stock; if (!isnan(w)) lastPubWeight = w;
+
+  // ----------------------------------------------------------
+  // MQTT PUBLISH
+  // ----------------------------------------------------------
+  if (mqtt.connected()) {
+    bool published = mqtt.publish(topicTelemetry, buf, false);
+
+    if (published) {
+      msgsSent++;
+      lastPubMs = millis();
+
+      if (stock >= 0) {
+        lastPubStock = stock;
+      }
+
+      if (!isnan(weight)) {
+        lastPubWeight = weight;
+      }
+    } else {
+      Serial.println("[MQTT] telemetry publish gagal");
+    }
   }
 }
 
-// ---------- setup / loop ----------
+// ============================================================
+// SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_TRIG, OUTPUT); pinMode(PIN_ECHO, INPUT);
+  delay(500);
 
+  Serial.println();
+  Serial.println("================================");
+  Serial.println(" SMART PET FEEDER");
+  Serial.println(" ESP32 Firmware");
+  Serial.println("================================");
+
+  // ==========================================================
+  // PIN SETUP
+  // ==========================================================
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  // ==========================================================
+  // HX711
+  // ==========================================================
   scale.begin(PIN_HX_DT, PIN_HX_SCK);
   scale.set_scale(HX711_CAL_FACTOR);
+  delay(300);
   scale.tare();
 
+  // ==========================================================
+  // SERVO
+  // ==========================================================
   gate.setPeriodHertz(50);
   gate.attach(PIN_SERVO, 500, 2400);
   gate.write(SERVO_CLOSED_DEG);
 
+  // ==========================================================
+  // MQTT TOPICS
+  // ==========================================================
   snprintf(topicTelemetry, sizeof(topicTelemetry), "petfeeder/%s/telemetry", DEVICE_ID);
-  snprintf(topicEvent,     sizeof(topicEvent),     "petfeeder/%s/event",     DEVICE_ID);
-  snprintf(topicStatus,    sizeof(topicStatus),    "petfeeder/%s/status",    DEVICE_ID);
-  snprintf(topicCmd,       sizeof(topicCmd),       "petfeeder/%s/cmd",       DEVICE_ID);
+  snprintf(topicEvent, sizeof(topicEvent), "petfeeder/%s/event", DEVICE_ID);
+  snprintf(topicStatus, sizeof(topicStatus), "petfeeder/%s/status", DEVICE_ID);
+  snprintf(topicCmd, sizeof(topicCmd), "petfeeder/%s/cmd", DEVICE_ID);
 
+  Serial.println("[MQTT] Topics:");
+  Serial.println(topicTelemetry);
+  Serial.println(topicEvent);
+  Serial.println(topicStatus);
+  Serial.println(topicCmd);
+
+  // ==========================================================
+  // WIFI
+  // ==========================================================
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { delay(300); Serial.print("."); }
-  Serial.println(WiFi.status() == WL_CONNECTED ? "\n[WiFi] terhubung" : "\n[WiFi] belum terhubung (mode offline, edge tetap jalan)");
 
-  configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");  // sync sekali; RTC lanjut sendiri
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("[WiFi] connected | IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("[WiFi] belum terhubung");
+    Serial.println("[WiFi] edge mode tetap berjalan");
+  }
+
+  // ==========================================================
+  // NTP
+  // ==========================================================
+  configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+
+  // ==========================================================
+  // TLS
+  // ==========================================================
 #if TLS_VERIFY_CA
-  net.setCACert(ROOT_CA);       // verifikasi sertifikat broker (butuh waktu valid dari NTP)
+  /*
+    FINAL / REAL DEVICE
+
+    Sertifikat CA broker digunakan
+    untuk memverifikasi broker.
+  */
+  net.setCACert(ROOT_CA);
 #else
-  net.setInsecure();            // HANYA untuk simulasi. Final: TLS_VERIFY_CA = 1
+  /*
+    SIMULATION / WOKWI
+
+    Jangan digunakan untuk deployment final.
+  */
+  net.setInsecure();
 #endif
+
+  // ==========================================================
+  // MQTT
+  // ==========================================================
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMessage);
   mqtt.setBufferSize(512);
+  mqtt.setKeepAlive(60);
+
+  Serial.println("[SYSTEM] setup selesai");
 }
 
+// ============================================================
+// LOOP
+// ============================================================
 void loop() {
+  // ==========================================================
+  // WIFI
+  // ==========================================================
+  connectWiFi();
+
+  // ==========================================================
+  // MQTT
+  // ==========================================================
   connectMqtt();
-  mqtt.loop();
-  flushEvents();
 
-  if (pendingTare) { pendingTare = false; scale.tare(); Serial.println("[CMD] tare"); }
-  if (pendingFeed) { pendingFeed = false; feedPortion(pendingFeedG, "manual"); }
+  if (mqtt.connected()) {
+    mqtt.loop();
+    flushEvents();
+  }
 
+  // ==========================================================
+  // TARE COMMAND
+  // ==========================================================
+  if (pendingTare) {
+    pendingTare = false;
+    Serial.println("[CMD] melakukan tare...");
+
+    if (scale.is_ready()) {
+      scale.tare();
+      Serial.println("[CMD] tare selesai");
+      emitEvent("tare", "OK", 0, 0, "manual_tare", "manual");
+    } else {
+      Serial.println("[CMD] tare gagal: HX711 tidak siap");
+      emitEvent("tare", "FAILED", 0, 0, "hx711_not_ready", "manual");
+    }
+  }
+
+  // ==========================================================
+  // MANUAL FEED COMMAND
+  // ==========================================================
+  if (pendingFeed) {
+    pendingFeed = false;
+    feedPortion(pendingFeedG, "manual");
+  }
+
+  // ==========================================================
+  // SCHEDULE
+  // ==========================================================
   runScheduler();
 
+  // ==========================================================
+  // SENSOR SAMPLING
+  // ==========================================================
   if (millis() - lastSampleMs >= SAMPLE_INTERVAL_MS) {
     lastSampleMs = millis();
     sampleAndPublish();
   }
+
+  // ==========================================================
+  // SMALL DELAY
+  // ==========================================================
+  delay(5);
 }
