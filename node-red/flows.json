@@ -1,0 +1,10 @@
+[
+  { "id": "flow1", "type": "tab", "label": "Smart Pet Feeder", "disabled": false, "info": "Placeholder. Isi broker, lalu tambah node InfluxDB, dashboard, dan Telegram." },
+  { "id": "tls1", "type": "tls-config", "name": "tls-broker", "cert": "", "key": "", "ca": "", "certname": "", "keyname": "", "caname": "", "servername": "", "verifyservercert": true },
+  { "id": "broker1", "type": "mqtt-broker", "name": "Broker TLS", "broker": "ISI_HOST_BROKER", "port": "8883", "tls": "tls1", "clientid": "nodered-petfeeder", "autoConnect": true, "usetls": true, "protocolVersion": "4", "keepalive": "60", "cleansession": true },
+  { "id": "in_tele", "type": "mqtt in", "z": "flow1", "name": "telemetry", "topic": "petfeeder/+/telemetry", "qos": "1", "datatype": "json", "broker": "broker1", "x": 130, "y": 80, "wires": [["dbg_tele"]] },
+  { "id": "dbg_tele", "type": "debug", "z": "flow1", "name": "telemetry -> TODO InfluxDB + gauge dashboard", "active": true, "tosidebar": true, "complete": "payload", "x": 440, "y": 80, "wires": [] },
+  { "id": "in_evt", "type": "mqtt in", "z": "flow1", "name": "event", "topic": "petfeeder/+/event", "qos": "1", "datatype": "json", "broker": "broker1", "x": 120, "y": 160, "wires": [["fn_alert"]] },
+  { "id": "fn_alert", "type": "function", "z": "flow1", "name": "format notifikasi", "func": "const e = msg.payload;\nlet text = null;\nif (e.type === 'low_stock') text = '⚠️ Stok makanan menipis (' + e.device + ')';\nif (e.type === 'feed' && e.status === 'FAILED') text = '❌ Pemberian makan gagal (' + e.device + '): ' + e.delivered_g + ' g dari ' + e.target_g + ' g';\nif (!text) return null;\nmsg.payload = { chatId: 'ISI_CHAT_ID', type: 'message', content: text };\nreturn msg;", "outputs": 1, "x": 340, "y": 160, "wires": [["dbg_alert"]] },
+  { "id": "dbg_alert", "type": "debug", "z": "flow1", "name": "notifikasi -> TODO node Telegram", "active": true, "tosidebar": true, "complete": "payload", "x": 600, "y": 160, "wires": [] }
+]

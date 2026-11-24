@@ -1,0 +1,11 @@
+# Kredensial: JANGAN pernah di-commit
+secrets.h
+.env
+flows_cred.json
+*.pem
+!ca_cert.h
+# Build / editor
+.pio/
+build/
+.vscode/
+.DS_Store

@@ -1,0 +1,4 @@
+PubSubClient
+ArduinoJson
+ESP32Servo
+HX711
